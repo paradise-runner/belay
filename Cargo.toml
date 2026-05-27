@@ -1,0 +1,8 @@
+[package]
+name = "belay"
+version = "0.1.0"
+edition = "2021"
+description = "A small CLI for standing up opinionated project folders."
+license = "MIT"
+
+[dependencies]
