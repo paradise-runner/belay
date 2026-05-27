@@ -1,7 +1,7 @@
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io;
+use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -10,10 +10,18 @@ const DEFAULT_PYTHON: &str = "3.13";
 const DEFAULT_BRANCH: &str = "main";
 const BELAY_BEGIN: &str = "# >>> belay shell integration >>>";
 const BELAY_END: &str = "# <<< belay shell integration <<<";
+const ANSI_RESET: &str = "\x1b[0m";
+const ANSI_BOLD: &str = "\x1b[1m";
+const ANSI_PINK: &str = "\x1b[38;2;231;89;154m";
+const ANSI_PLUM: &str = "\x1b[38;2;181;72;157m";
+const ANSI_PURPLE: &str = "\x1b[38;2;112;67;174m";
+const ANSI_INDIGO: &str = "\x1b[38;2;69;72;169m";
+const ANSI_DEEP_BLUE: &str = "\x1b[38;2;47;95;184m";
 
 fn main() {
     if let Err(err) = run(env::args_os().skip(1).collect()) {
-        eprintln!("belay: {err}");
+        let theme = Theme::stderr();
+        eprintln!("{}: {err}", theme.paint("belay", Tone::Pink));
         std::process::exit(1);
     }
 }
@@ -30,7 +38,12 @@ fn run(args: Vec<OsString>) -> Result<(), BelayError> {
             Ok(())
         }
         "-V" | "--version" | "version" => {
-            println!("belay {VERSION}");
+            let theme = Theme::stdout();
+            println!(
+                "{} {}",
+                theme.paint("belay", Tone::Pink),
+                theme.paint(VERSION, Tone::DeepBlue)
+            );
             Ok(())
         }
         "py" => run_py(&args[1..]),
@@ -151,29 +164,40 @@ fn finish_project_creation_with_git_runner<R: GitRunner>(
         return Ok(());
     }
 
-    println!("created {}", project_dir.display());
+    let stdout_theme = Theme::stdout();
+    println!(
+        "{} {}",
+        stdout_theme.paint("created", Tone::Pink),
+        stdout_theme.paint(project_dir.display(), Tone::DeepBlue)
+    );
 
     if auto_shell {
+        let stderr_theme = Theme::stderr();
         match detect_shell()
             .and_then(|shell| install_shell_integration(shell).map(|path| (shell, path)))
         {
             Ok((shell, path)) => {
                 eprintln!(
-                    "installed {shell} integration at {}; restart or source your shell config for automatic cd",
-                    path.display()
+                    "{} {} integration at {}; restart or source your shell config for automatic cd",
+                    stderr_theme.paint("installed", Tone::Pink),
+                    stderr_theme.paint(shell, Tone::Purple),
+                    stderr_theme.paint(path.display(), Tone::DeepBlue)
                 );
             }
             Err(err) => {
                 eprintln!(
-                    "shell integration not installed automatically: {err}\nRun `belay shell install` after setup."
+                    "{}: {err}\nRun `belay shell install` after setup.",
+                    stderr_theme.paint("shell integration not installed automatically", Tone::Pink)
                 );
             }
         }
     }
 
+    let stderr_theme = Theme::stderr();
     eprintln!(
-        "current process cannot cd the parent shell; run `cd {}` now",
-        project_dir.display()
+        "{}; run `cd {}` now",
+        stderr_theme.paint("current process cannot cd the parent shell", Tone::Pink),
+        stderr_theme.paint(project_dir.display(), Tone::DeepBlue)
     );
     Ok(())
 }
@@ -205,7 +229,13 @@ fn run_shell(args: &[OsString]) -> Result<(), BelayError> {
             }
             let shell = shell_arg(args)?.unwrap_or(detect_shell()?);
             let path = install_shell_integration(shell)?;
-            println!("installed {shell} integration at {}", path.display());
+            let theme = Theme::stdout();
+            println!(
+                "{} {} integration at {}",
+                theme.paint("installed", Tone::Pink),
+                theme.paint(shell, Tone::Purple),
+                theme.paint(path.display(), Tone::DeepBlue)
+            );
             Ok(())
         }
         other => Err(BelayError::usage(format!(
@@ -937,63 +967,228 @@ end
     }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Tone {
+    Pink,
+    Plum,
+    Purple,
+    Indigo,
+    DeepBlue,
+}
+
+impl Tone {
+    fn ansi(self) -> &'static str {
+        match self {
+            Self::Pink => ANSI_PINK,
+            Self::Plum => ANSI_PLUM,
+            Self::Purple => ANSI_PURPLE,
+            Self::Indigo => ANSI_INDIGO,
+            Self::DeepBlue => ANSI_DEEP_BLUE,
+        }
+    }
+}
+
+const BANNER_LETTERS: [[&str; 6]; 5] = [
+    [
+        "██████╗ ",
+        "██╔══██╗",
+        "██████╔╝",
+        "██╔══██╗",
+        "██████╔╝",
+        "╚═════╝ ",
+    ],
+    [
+        "███████╗",
+        "██╔════╝",
+        "█████╗  ",
+        "██╔══╝  ",
+        "███████╗",
+        "╚══════╝",
+    ],
+    [
+        "██╗     ",
+        "██║     ",
+        "██║     ",
+        "██║     ",
+        "███████╗",
+        "╚══════╝",
+    ],
+    [
+        " █████╗ ",
+        "██╔══██╗",
+        "███████║",
+        "██╔══██║",
+        "██║  ██║",
+        "╚═╝  ╚═╝",
+    ],
+    [
+        "██╗   ██╗",
+        "╚██╗ ██╔╝",
+        " ╚████╔╝ ",
+        "  ╚██╔╝  ",
+        "   ██║   ",
+        "   ╚═╝   ",
+    ],
+];
+const BANNER_TONES: [Tone; 5] = [
+    Tone::Pink,
+    Tone::Plum,
+    Tone::Purple,
+    Tone::Indigo,
+    Tone::DeepBlue,
+];
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct Theme {
+    enabled: bool,
+}
+
+impl Theme {
+    fn stdout() -> Self {
+        Self::for_terminal(io::stdout().is_terminal())
+    }
+
+    fn stderr() -> Self {
+        Self::for_terminal(io::stderr().is_terminal())
+    }
+
+    fn for_terminal(is_terminal: bool) -> Self {
+        Self {
+            enabled: is_terminal && env::var_os("NO_COLOR").is_none(),
+        }
+    }
+
+    fn paint(self, value: impl std::fmt::Display, tone: Tone) -> String {
+        if self.enabled {
+            format!("{}{value}{ANSI_RESET}", tone.ansi())
+        } else {
+            value.to_string()
+        }
+    }
+
+    fn heading(self, value: &str) -> String {
+        if self.enabled {
+            format!("{ANSI_BOLD}{ANSI_PINK}{value}{ANSI_RESET}")
+        } else {
+            value.to_string()
+        }
+    }
+}
+
+fn render_banner(theme: Theme) -> String {
+    let mut banner = String::new();
+    for row in 0..BANNER_LETTERS[0].len() {
+        for (letter, tone) in BANNER_LETTERS.iter().zip(BANNER_TONES) {
+            banner.push_str(&theme.paint(letter[row], tone));
+        }
+        banner.push('\n');
+    }
+    banner
+}
+
+fn print_banner(theme: Theme) {
+    println!("{}", render_banner(theme));
+}
+
 fn print_help() {
+    let theme = Theme::stdout();
+    print_banner(theme);
     println!(
-        r#"belay {VERSION}
+        r#"{brand} {version}
 
-Usage:
-  belay py <name> [--python <version>] [--no-shell]
-  belay rs <name> [--no-shell]
-  belay shell init [fish|bash|zsh]
-  belay shell install [fish|bash|zsh]
+{usage}:
+  {brand} {py} <name> [{python} <version>] [{no_shell}]
+  {brand} {rs} <name> [{no_shell}]
+  {brand} {shell} {init} [fish|bash|zsh]
+  {brand} {shell} {install} [fish|bash|zsh]
 
-Commands:
-  py       Create a typed uv Python project and print/cd to it through shell integration
-  rs       Create a Cargo Rust project with Git and print/cd to it through shell integration
-  shell    Print or install shell integration for automatic cd
-"#
+{commands}:
+  {py}       Create a typed uv Python project and print/cd to it through shell integration
+  {rs}       Create a Cargo Rust project with Git and print/cd to it through shell integration
+  {shell}    Print or install shell integration for automatic cd
+"#,
+        brand = theme.paint("belay", Tone::Pink),
+        version = theme.paint(VERSION, Tone::DeepBlue),
+        usage = theme.heading("Usage"),
+        commands = theme.heading("Commands"),
+        py = theme.paint("py", Tone::Purple),
+        rs = theme.paint("rs", Tone::Purple),
+        shell = theme.paint("shell", Tone::Purple),
+        init = theme.paint("init", Tone::Purple),
+        install = theme.paint("install", Tone::Purple),
+        python = theme.paint("--python", Tone::Purple),
+        no_shell = theme.paint("--no-shell", Tone::Purple),
     );
 }
 
 fn print_py_help() {
+    let theme = Theme::stdout();
+    print_banner(theme);
     println!(
-        r#"Usage:
-  belay py <name> [--python <version>] [--no-shell]
+        r#"{usage}:
+  {brand} {py} <name> [{python} <version>] [{no_shell}]
 
-Creates a new directory in the current working directory with:
+{creates} a new directory in the current working directory with:
   pyproject.toml, src/<module>, tests, README.md, .python-version
   uv init --lib, uv add --dev ruff ty pytest, a py.typed marker, and Git on main
 
-Options:
-  --python <version>  Python lower bound and .python-version value (default: {DEFAULT_PYTHON})
-  --no-shell          Skip automatic shell integration provisioning
-"#
+{options}:
+  {python} <version>  Python lower bound and .python-version value (default: {default_python})
+  {no_shell}          Skip automatic shell integration provisioning
+"#,
+        usage = theme.heading("Usage"),
+        brand = theme.paint("belay", Tone::Pink),
+        py = theme.paint("py", Tone::Purple),
+        python = theme.paint("--python", Tone::Purple),
+        no_shell = theme.paint("--no-shell", Tone::Purple),
+        creates = theme.heading("Creates"),
+        options = theme.heading("Options"),
+        default_python = theme.paint(DEFAULT_PYTHON, Tone::DeepBlue),
     );
 }
 
 fn print_rs_help() {
+    let theme = Theme::stdout();
+    print_banner(theme);
     println!(
-        r#"Usage:
-  belay rs <name> [--no-shell]
+        r#"{usage}:
+  {brand} {rs} <name> [{no_shell}]
 
-Creates a new directory in the current working directory with:
+{creates} a new directory in the current working directory with:
   cargo new --bin --vcs none, Git initialized on main, README.md, .editorconfig, and .gitignore
 
-Options:
-  --no-shell  Skip automatic shell integration provisioning
-"#
+{options}:
+  {no_shell}  Skip automatic shell integration provisioning
+"#,
+        usage = theme.heading("Usage"),
+        brand = theme.paint("belay", Tone::Pink),
+        rs = theme.paint("rs", Tone::Purple),
+        no_shell = theme.paint("--no-shell", Tone::Purple),
+        creates = theme.heading("Creates"),
+        options = theme.heading("Options"),
     );
 }
 
 fn print_shell_help() {
+    let theme = Theme::stdout();
+    print_banner(theme);
     println!(
-        r#"Usage:
-  belay shell init [fish|bash|zsh]
-  belay shell install [fish|bash|zsh]
+        r#"{usage}:
+  {brand} {shell} {init} [fish|bash|zsh]
+  {brand} {shell} {install} [fish|bash|zsh]
 
-`init` prints the function for manual shell setup.
-`install` writes a managed integration block/file so `belay py <name>` and `belay rs <name>` can cd into the new directory.
-"#
+{init_quoted} prints the function for manual shell setup.
+{install_quoted} writes a managed integration block/file so `{brand} {py} <name>` and `{brand} {rs} <name>` can cd into the new directory.
+"#,
+        usage = theme.heading("Usage"),
+        brand = theme.paint("belay", Tone::Pink),
+        shell = theme.paint("shell", Tone::Purple),
+        init = theme.paint("init", Tone::Purple),
+        install = theme.paint("install", Tone::Purple),
+        init_quoted = theme.paint("`init`", Tone::Purple),
+        install_quoted = theme.paint("`install`", Tone::Purple),
+        py = theme.paint("py", Tone::Purple),
+        rs = theme.paint("rs", Tone::Purple),
     );
 }
 
@@ -1197,6 +1392,42 @@ edition = "2021"
                 (window[0] == flag).then(|| window[1].to_string_lossy().into_owned())
             })
             .ok_or_else(|| BelayError::usage(format!("missing fake uv arg `{flag}`")))
+    }
+
+    #[test]
+    fn enabled_theme_uses_the_belay_palette() {
+        let theme = Theme { enabled: true };
+        let banner = render_banner(theme);
+
+        assert_eq!(
+            theme.paint("belay", Tone::Pink),
+            format!("{ANSI_PINK}belay{ANSI_RESET}")
+        );
+        assert_eq!(
+            theme.paint("py", Tone::Purple),
+            format!("{ANSI_PURPLE}py{ANSI_RESET}")
+        );
+        assert_eq!(
+            theme.heading("Usage"),
+            format!("{ANSI_BOLD}{ANSI_PINK}Usage{ANSI_RESET}")
+        );
+        assert!(banner.contains(ANSI_PINK));
+        assert!(banner.contains(ANSI_PLUM));
+        assert!(banner.contains(ANSI_PURPLE));
+        assert!(banner.contains(ANSI_INDIGO));
+        assert!(banner.contains(ANSI_DEEP_BLUE));
+    }
+
+    #[test]
+    fn disabled_theme_banner_and_shell_functions_stay_plain() {
+        let theme = Theme { enabled: false };
+        let banner = render_banner(theme);
+
+        assert_eq!(theme.paint("/tmp/project", Tone::DeepBlue), "/tmp/project");
+        assert_eq!(theme.heading("Usage"), "Usage");
+        assert!(banner.starts_with("██████╗ ███████╗██╗"));
+        assert!(!banner.contains('\u{1b}'));
+        assert!(!shell_function(Shell::Zsh).contains('\u{1b}'));
     }
 
     #[test]
