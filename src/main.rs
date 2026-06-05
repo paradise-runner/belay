@@ -4,24 +4,46 @@ use std::fs;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::OnceLock;
+
+#[cfg(unix)]
+use std::fs::{File, OpenOptions};
+#[cfg(unix)]
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::process::Stdio;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_PYTHON: &str = "3.13";
 const DEFAULT_BRANCH: &str = "main";
+const DEFAULT_COBRA_VERSION: &str = "v1.8.1";
 const BELAY_BEGIN: &str = "# >>> belay shell integration >>>";
 const BELAY_END: &str = "# <<< belay shell integration <<<";
-const ANSI_RESET: &str = "\x1b[0m";
-const ANSI_BOLD: &str = "\x1b[1m";
-const ANSI_PINK: &str = "\x1b[38;2;231;89;154m";
-const ANSI_PLUM: &str = "\x1b[38;2;181;72;157m";
-const ANSI_PURPLE: &str = "\x1b[38;2;112;67;174m";
-const ANSI_INDIGO: &str = "\x1b[38;2;69;72;169m";
-const ANSI_DEEP_BLUE: &str = "\x1b[38;2;47;95;184m";
+const SGR_RESET: &str = "\x1b[0m";
+const SGR_BOLD: &str = "\x1b[1m";
+const SGR_NOT_BOLD: &str = "\x1b[22m";
+const SGR_PINK: &str = "\x1b[38;2;231;89;154m";
+const SGR_PLUM: &str = "\x1b[38;2;201;80;177m";
+const SGR_VIOLET: &str = "\x1b[38;2;153;102;231m";
+const SGR_INDIGO: &str = "\x1b[38;2;101;112;217m";
+const SGR_BLUE: &str = "\x1b[38;2;69;147;230m";
+const SGR_DARK_PINK: &str = "\x1b[38;2;176;30;101m";
+const SGR_DARK_PLUM: &str = "\x1b[38;2;142;37;124m";
+const SGR_PURPLE: &str = "\x1b[38;2;112;67;174m";
+const SGR_DARK_INDIGO: &str = "\x1b[38;2;62;69;148m";
+const SGR_DARK_BLUE: &str = "\x1b[38;2;30;86;163m";
+const SGR_WHITE: &str = "\x1b[38;2;255;255;255m";
+const SGR_BLACK: &str = "\x1b[38;2;0;0;0m";
+const OSC_BACKGROUND_QUERY: &[u8] = b"\x1b]11;?\x1b\\";
+static TERMINAL_BACKGROUND: OnceLock<Background> = OnceLock::new();
 
 fn main() {
     if let Err(err) = run(env::args_os().skip(1).collect()) {
         let theme = Theme::stderr();
-        eprintln!("{}: {err}", theme.paint("belay", Tone::Pink));
+        eprintln!(
+            "{}",
+            theme.message(format!("{}: {err}", theme.accent("belay")))
+        );
         std::process::exit(1);
     }
 }
@@ -40,14 +62,14 @@ fn run(args: Vec<OsString>) -> Result<(), BelayError> {
         "-V" | "--version" | "version" => {
             let theme = Theme::stdout();
             println!(
-                "{} {}",
-                theme.paint("belay", Tone::Pink),
-                theme.paint(VERSION, Tone::DeepBlue)
+                "{}",
+                theme.message(format!("{} {VERSION}", theme.accent("belay")))
             );
             Ok(())
         }
         "py" => run_py(&args[1..]),
-        "rs" => run_rs(&args[1..]),
+        "rs-cli" => run_rs_cli(&args[1..]),
+        "go-cli" => run_go_cli(&args[1..]),
         "shell" => run_shell(&args[1..]),
         other => Err(BelayError::usage(format!(
             "unknown command `{other}`\n\nRun `belay --help` for usage."
@@ -103,7 +125,32 @@ fn run_py(args: &[OsString]) -> Result<(), BelayError> {
     finish_project_creation(&project_dir, auto_shell)
 }
 
-fn run_rs(args: &[OsString]) -> Result<(), BelayError> {
+fn run_rs_cli(args: &[OsString]) -> Result<(), BelayError> {
+    let Some((project_name, auto_shell)) = parse_name_and_shell_option(args, "rs-cli")? else {
+        return Ok(());
+    };
+
+    let spec = RustCliProjectSpec::new(&project_name)?;
+    let project_dir = env::current_dir()?.join(&spec.directory_name);
+    create_rust_cli_project(&project_dir, &spec)?;
+    finish_project_creation(&project_dir, auto_shell)
+}
+
+fn run_go_cli(args: &[OsString]) -> Result<(), BelayError> {
+    let Some((project_name, auto_shell)) = parse_name_and_shell_option(args, "go-cli")? else {
+        return Ok(());
+    };
+
+    let spec = GoCliProjectSpec::new(&project_name)?;
+    let project_dir = env::current_dir()?.join(&spec.directory_name);
+    create_go_cli_project(&project_dir, &spec)?;
+    finish_project_creation(&project_dir, auto_shell)
+}
+
+fn parse_name_and_shell_option(
+    args: &[OsString],
+    command_name: &str,
+) -> Result<Option<(String, bool)>, BelayError> {
     let mut project_name: Option<String> = None;
     let mut auto_shell = auto_shell_enabled();
 
@@ -113,8 +160,12 @@ fn run_rs(args: &[OsString]) -> Result<(), BelayError> {
         };
 
         if arg == "-h" || arg == "--help" {
-            print_rs_help();
-            return Ok(());
+            match command_name {
+                "rs-cli" => print_rs_cli_help(),
+                "go-cli" => print_go_cli_help(),
+                _ => {}
+            }
+            return Ok(None);
         } else if arg == "--no-shell" {
             auto_shell = false;
         } else if arg.starts_with('-') {
@@ -122,22 +173,19 @@ fn run_rs(args: &[OsString]) -> Result<(), BelayError> {
         } else if project_name.is_none() {
             project_name = Some(arg.to_string());
         } else {
-            return Err(BelayError::usage(
-                "`belay rs` accepts exactly one project name",
-            ));
+            return Err(BelayError::usage(format!(
+                "`belay {command_name}` accepts exactly one project name"
+            )));
         }
     }
 
     let Some(project_name) = project_name else {
-        return Err(BelayError::usage(
-            "missing project name\n\nUsage: belay rs <name>",
-        ));
+        return Err(BelayError::usage(format!(
+            "missing project name\n\nUsage: belay {command_name} <name>"
+        )));
     };
 
-    let spec = RustProjectSpec::new(&project_name)?;
-    let project_dir = env::current_dir()?.join(&spec.directory_name);
-    create_rust_project(&project_dir, &spec)?;
-    finish_project_creation(&project_dir, auto_shell)
+    Ok(Some((project_name, auto_shell)))
 }
 
 fn auto_shell_enabled() -> bool {
@@ -166,9 +214,12 @@ fn finish_project_creation_with_git_runner<R: GitRunner>(
 
     let stdout_theme = Theme::stdout();
     println!(
-        "{} {}",
-        stdout_theme.paint("created", Tone::Pink),
-        stdout_theme.paint(project_dir.display(), Tone::DeepBlue)
+        "{}",
+        stdout_theme.message(format!(
+            "{} {}",
+            stdout_theme.accent("created"),
+            project_dir.display()
+        ))
     );
 
     if auto_shell {
@@ -178,16 +229,22 @@ fn finish_project_creation_with_git_runner<R: GitRunner>(
         {
             Ok((shell, path)) => {
                 eprintln!(
+                    "{}",
+                    stderr_theme.message(format!(
                     "{} {} integration at {}; restart or source your shell config for automatic cd",
-                    stderr_theme.paint("installed", Tone::Pink),
-                    stderr_theme.paint(shell, Tone::Purple),
-                    stderr_theme.paint(path.display(), Tone::DeepBlue)
+                    stderr_theme.accent("installed"),
+                    stderr_theme.accent(shell),
+                    path.display()
+                ))
                 );
             }
             Err(err) => {
                 eprintln!(
-                    "{}: {err}\nRun `belay shell install` after setup.",
-                    stderr_theme.paint("shell integration not installed automatically", Tone::Pink)
+                    "{}",
+                    stderr_theme.message(format!(
+                        "{}: {err}\nRun `belay shell install` after setup.",
+                        stderr_theme.accent("shell integration not installed automatically")
+                    ))
                 );
             }
         }
@@ -195,9 +252,12 @@ fn finish_project_creation_with_git_runner<R: GitRunner>(
 
     let stderr_theme = Theme::stderr();
     eprintln!(
-        "{}; run `cd {}` now",
-        stderr_theme.paint("current process cannot cd the parent shell", Tone::Pink),
-        stderr_theme.paint(project_dir.display(), Tone::DeepBlue)
+        "{}",
+        stderr_theme.message(format!(
+            "{}; run `cd {}` now",
+            stderr_theme.accent("current process cannot cd the parent shell"),
+            project_dir.display()
+        ))
     );
     Ok(())
 }
@@ -231,10 +291,13 @@ fn run_shell(args: &[OsString]) -> Result<(), BelayError> {
             let path = install_shell_integration(shell)?;
             let theme = Theme::stdout();
             println!(
-                "{} {} integration at {}",
-                theme.paint("installed", Tone::Pink),
-                theme.paint(shell, Tone::Purple),
-                theme.paint(path.display(), Tone::DeepBlue)
+                "{}",
+                theme.message(format!(
+                    "{} {} integration at {}",
+                    theme.accent("installed"),
+                    theme.accent(shell),
+                    path.display()
+                ))
             );
             Ok(())
         }
@@ -306,19 +369,44 @@ impl PythonProjectSpec {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct RustProjectSpec {
+struct RustCliProjectSpec {
     directory_name: String,
     package_name: String,
+    crate_name: String,
+    command_name: String,
 }
 
-impl RustProjectSpec {
+impl RustCliProjectSpec {
     fn new(name: &str) -> Result<Self, BelayError> {
         validate_project_name(name)?;
-        validate_rust_package_name(name)?;
+        let command_name = cli_slug_for(name)?;
+        let crate_name = command_name.replace('-', "_");
 
         Ok(Self {
             directory_name: name.to_string(),
-            package_name: name.to_string(),
+            package_name: command_name.clone(),
+            crate_name,
+            command_name,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GoCliProjectSpec {
+    directory_name: String,
+    module_name: String,
+    command_name: String,
+}
+
+impl GoCliProjectSpec {
+    fn new(name: &str) -> Result<Self, BelayError> {
+        validate_project_name(name)?;
+        let command_name = cli_slug_for(name)?;
+
+        Ok(Self {
+            directory_name: name.to_string(),
+            module_name: command_name.clone(),
+            command_name,
         })
     }
 }
@@ -340,16 +428,6 @@ fn validate_project_name(name: &str) -> Result<(), BelayError> {
     {
         return Err(BelayError::usage(
             "project name may only contain ASCII letters, numbers, underscores, dashes, and dots",
-        ));
-    }
-
-    Ok(())
-}
-
-fn validate_rust_package_name(name: &str) -> Result<(), BelayError> {
-    if name.contains('.') {
-        return Err(BelayError::usage(
-            "Rust project names may only contain ASCII letters, numbers, underscores, and dashes",
         ));
     }
 
@@ -383,6 +461,33 @@ fn module_name_for(project_name: &str) -> Result<String, BelayError> {
     Ok(module_name)
 }
 
+fn cli_slug_for(project_name: &str) -> Result<String, BelayError> {
+    let slug = project_name
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| if ch == '_' || ch == '.' { '-' } else { ch })
+        .collect::<String>();
+
+    let mut chars = slug.chars();
+    let Some(first) = chars.next() else {
+        return Err(BelayError::usage("project name cannot be empty"));
+    };
+
+    if !first.is_ascii_alphabetic() {
+        return Err(BelayError::usage(
+            "CLI project names must normalize to a name starting with a letter",
+        ));
+    }
+
+    if !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '-') {
+        return Err(BelayError::usage(
+            "CLI project names must normalize to lowercase letters, numbers, and dashes",
+        ));
+    }
+
+    Ok(slug)
+}
+
 fn ruff_target_for(python_version: &str) -> Result<String, BelayError> {
     let Some((major, minor)) = python_version.split_once('.') else {
         return Err(BelayError::usage("python version must look like `3.13`"));
@@ -406,7 +511,10 @@ fn create_python_project(project_dir: &Path, spec: &PythonProjectSpec) -> Result
     create_python_project_with_runner(project_dir, spec, &SystemUvRunner)
 }
 
-fn create_rust_project(project_dir: &Path, spec: &RustProjectSpec) -> Result<(), BelayError> {
+fn create_rust_cli_project(
+    project_dir: &Path,
+    spec: &RustCliProjectSpec,
+) -> Result<(), BelayError> {
     if project_dir.exists() {
         return Err(BelayError::usage(format!(
             "{} already exists",
@@ -414,7 +522,43 @@ fn create_rust_project(project_dir: &Path, spec: &RustProjectSpec) -> Result<(),
         )));
     }
 
-    create_rust_project_with_runner(project_dir, spec, &SystemCargoRunner)
+    let src_dir = project_dir.join("src");
+    let tests_dir = project_dir.join("tests");
+
+    fs::create_dir_all(&src_dir)?;
+    fs::create_dir_all(&tests_dir)?;
+
+    write_file(project_dir.join(".editorconfig"), editorconfig())?;
+    write_file(project_dir.join(".gitignore"), rust_gitignore())?;
+    write_file(project_dir.join("Cargo.toml"), rust_cli_cargo_toml(spec))?;
+    write_file(project_dir.join("README.md"), rust_cli_readme(spec))?;
+    write_file(src_dir.join("lib.rs"), rust_cli_lib_rs())?;
+    write_file(src_dir.join("main.rs"), rust_cli_main_rs(spec))?;
+    write_file(tests_dir.join("smoke.rs"), rust_cli_smoke_test(spec))?;
+
+    Ok(())
+}
+
+fn create_go_cli_project(project_dir: &Path, spec: &GoCliProjectSpec) -> Result<(), BelayError> {
+    if project_dir.exists() {
+        return Err(BelayError::usage(format!(
+            "{} already exists",
+            project_dir.display()
+        )));
+    }
+
+    let cmd_dir = project_dir.join("cmd");
+    fs::create_dir_all(&cmd_dir)?;
+
+    write_file(project_dir.join(".editorconfig"), editorconfig())?;
+    write_file(project_dir.join(".gitignore"), go_gitignore())?;
+    write_file(project_dir.join("go.mod"), go_cli_go_mod(spec))?;
+    write_file(project_dir.join("README.md"), go_cli_readme(spec))?;
+    write_file(project_dir.join("main.go"), go_cli_main_go(spec))?;
+    write_file(cmd_dir.join("root.go"), go_cli_root_go(spec))?;
+    write_file(cmd_dir.join("root_test.go"), go_cli_root_test_go())?;
+
+    Ok(())
 }
 
 fn create_python_project_with_runner<R: UvRunner>(
@@ -434,21 +578,6 @@ fn create_python_project_with_runner<R: UvRunner>(
     Ok(())
 }
 
-fn create_rust_project_with_runner<R: CargoRunner>(
-    project_dir: &Path,
-    spec: &RustProjectSpec,
-    runner: &R,
-) -> Result<(), BelayError> {
-    let parent = project_dir
-        .parent()
-        .ok_or_else(|| BelayError::usage("project directory must have a parent"))?;
-
-    runner.run_cargo(parent, &cargo_new_args(project_dir, spec))?;
-    write_rust_overlays(project_dir, spec)?;
-
-    Ok(())
-}
-
 trait UvRunner {
     fn run_uv(&self, current_dir: &Path, args: &[OsString]) -> Result<(), BelayError>;
 }
@@ -458,18 +587,6 @@ struct SystemUvRunner;
 impl UvRunner for SystemUvRunner {
     fn run_uv(&self, current_dir: &Path, args: &[OsString]) -> Result<(), BelayError> {
         run_uv_command(current_dir, args)
-    }
-}
-
-trait CargoRunner {
-    fn run_cargo(&self, current_dir: &Path, args: &[OsString]) -> Result<(), BelayError>;
-}
-
-struct SystemCargoRunner;
-
-impl CargoRunner for SystemCargoRunner {
-    fn run_cargo(&self, current_dir: &Path, args: &[OsString]) -> Result<(), BelayError> {
-        run_cargo_command(current_dir, args)
     }
 }
 
@@ -513,18 +630,6 @@ fn uv_add_dev_args() -> Vec<OsString> {
     ]
 }
 
-fn cargo_new_args(project_dir: &Path, spec: &RustProjectSpec) -> Vec<OsString> {
-    vec![
-        OsString::from("new"),
-        OsString::from("--bin"),
-        OsString::from("--vcs"),
-        OsString::from("none"),
-        OsString::from("--name"),
-        OsString::from(&spec.package_name),
-        project_dir.as_os_str().to_os_string(),
-    ]
-}
-
 fn git_init_args() -> Vec<OsString> {
     vec![
         OsString::from("init"),
@@ -535,10 +640,6 @@ fn git_init_args() -> Vec<OsString> {
 
 fn run_uv_command(current_dir: &Path, args: &[OsString]) -> Result<(), BelayError> {
     run_command("uv", current_dir, args)
-}
-
-fn run_cargo_command(current_dir: &Path, args: &[OsString]) -> Result<(), BelayError> {
-    run_command("cargo", current_dir, args)
 }
 
 fn run_git_command(current_dir: &Path, args: &[OsString]) -> Result<(), BelayError> {
@@ -628,13 +729,6 @@ fn write_python_overlays(project_dir: &Path, spec: &PythonProjectSpec) -> Result
     Ok(())
 }
 
-fn write_rust_overlays(project_dir: &Path, spec: &RustProjectSpec) -> Result<(), BelayError> {
-    write_file(project_dir.join(".editorconfig"), editorconfig())?;
-    write_file(project_dir.join("README.md"), rust_readme(spec))?;
-    append_gitignore_entries(&project_dir.join(".gitignore"), &["/target", ".DS_Store"])?;
-    Ok(())
-}
-
 fn initialize_git_repository_with_runner<R: GitRunner>(
     project_dir: &Path,
     runner: &R,
@@ -720,23 +814,6 @@ uv run pytest
     )
 }
 
-fn rust_readme(spec: &RustProjectSpec) -> String {
-    format!(
-        r#"# {project_name}
-
-## Development
-
-```sh
-cargo fmt
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test
-cargo run
-```
-"#,
-        project_name = spec.package_name
-    )
-}
-
 fn init_py(spec: &PythonProjectSpec) -> String {
     format!(
         r#""""{project_name}."""
@@ -793,28 +870,257 @@ dist/
 "#
 }
 
-fn append_gitignore_entries(path: &Path, entries: &[&str]) -> io::Result<()> {
-    let mut current = fs::read_to_string(path).unwrap_or_default();
+fn rust_gitignore() -> &'static str {
+    r#".DS_Store
+/target/
+"#
+}
 
-    if !current.is_empty() && !current.ends_with('\n') {
-        current.push('\n');
-    }
+fn go_gitignore() -> &'static str {
+    r#".DS_Store
+/bin/
+.coverprofile
+"#
+}
 
-    let mut changed = false;
-    for entry in entries {
-        if current.lines().any(|line| line == *entry) {
-            continue;
-        }
-        current.push_str(entry);
-        current.push('\n');
-        changed = true;
-    }
+fn rust_cli_cargo_toml(spec: &RustCliProjectSpec) -> String {
+    format!(
+        r#"[package]
+name = "{package_name}"
+version = "0.1.0"
+edition = "2021"
+description = "A polished CLI built with clap."
+license = "MIT"
 
-    if changed {
-        fs::write(path, current)?;
+[dependencies]
+clap = {{ version = "4.5", features = ["cargo", "derive", "string", "unicode", "wrap_help"] }}
+color-eyre = "0.6"
+"#,
+        package_name = spec.package_name
+    )
+}
+
+fn rust_cli_readme(spec: &RustCliProjectSpec) -> String {
+    format!(
+        r#"# {command_name}
+
+## Development
+
+```sh
+cargo fmt
+cargo test
+cargo run -- hello --name belay
+```
+"#,
+        command_name = spec.command_name
+    )
+}
+
+fn rust_cli_lib_rs() -> &'static str {
+    r#"pub fn render_greeting(name: &str) -> String {
+    format!("hello, {name}!")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_greeting;
+
+    #[test]
+    fn renders_greeting() {
+        assert_eq!(render_greeting("belay"), "hello, belay!");
     }
+}
+"#
+}
+
+fn rust_cli_main_rs(spec: &RustCliProjectSpec) -> String {
+    format!(
+        r#"use clap::builder::styling::{{AnsiColor, Effects, Styles}};
+use clap::{{Parser, Subcommand}};
+use color_eyre::eyre::Result;
+
+use {crate_name}::render_greeting;
+
+fn main() -> Result<()> {{
+    color_eyre::install()?;
+    let cli = Cli::parse();
+
+    match cli.command {{
+        Commands::Hello {{ name }} => {{
+            println!("{{}}", render_greeting(&name));
+        }}
+    }}
 
     Ok(())
+}}
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "{command_name}",
+    version,
+    about = "A polished CLI scaffold built with clap.",
+    styles = styles()
+)]
+struct Cli {{
+    #[command(subcommand)]
+    command: Commands,
+}}
+
+#[derive(Debug, Subcommand)]
+enum Commands {{
+    Hello {{
+        #[arg(short, long, default_value = "world")]
+        name: String,
+    }},
+}}
+
+fn styles() -> Styles {{
+    Styles::styled()
+        .header(AnsiColor::Yellow.on_default() | Effects::BOLD)
+        .usage(AnsiColor::Yellow.on_default() | Effects::BOLD)
+        .literal(AnsiColor::Cyan.on_default() | Effects::BOLD)
+        .placeholder(AnsiColor::Green.on_default())
+}}
+"#,
+        crate_name = spec.crate_name,
+        command_name = spec.command_name
+    )
+}
+
+fn rust_cli_smoke_test(spec: &RustCliProjectSpec) -> String {
+    format!(
+        r#"use {crate_name}::render_greeting;
+
+#[test]
+fn smoke() {{
+    assert_eq!(render_greeting("cli"), "hello, cli!");
+}}
+"#,
+        crate_name = spec.crate_name
+    )
+}
+
+fn go_cli_go_mod(spec: &GoCliProjectSpec) -> String {
+    format!(
+        r#"module {module_name}
+
+go 1.22
+
+require github.com/spf13/cobra {cobra_version}
+"#,
+        module_name = spec.module_name,
+        cobra_version = DEFAULT_COBRA_VERSION
+    )
+}
+
+fn go_cli_readme(spec: &GoCliProjectSpec) -> String {
+    format!(
+        r#"# {command_name}
+
+## Development
+
+```sh
+go test ./...
+go run . hello --name belay
+```
+"#,
+        command_name = spec.command_name
+    )
+}
+
+fn go_cli_main_go(spec: &GoCliProjectSpec) -> String {
+    format!(
+        r#"package main
+
+import (
+    "fmt"
+    "os"
+
+    "{module_name}/cmd"
+)
+
+func main() {{
+    if err := cmd.Execute(); err != nil {{
+        fmt.Fprintln(os.Stderr, err)
+        os.Exit(1)
+    }}
+}}
+"#,
+        module_name = spec.module_name
+    )
+}
+
+fn go_cli_root_go(spec: &GoCliProjectSpec) -> String {
+    format!(
+        r#"package cmd
+
+import (
+    "fmt"
+
+    "github.com/spf13/cobra"
+)
+
+type options struct {{
+    name string
+}}
+
+func Execute() error {{
+    return newRootCmd().Execute()
+}}
+
+func newRootCmd() *cobra.Command {{
+    opts := options{{}}
+
+    cmd := &cobra.Command{{
+        Use:           "{command_name}",
+        Short:         "A polished CLI scaffold built with Cobra.",
+        SilenceUsage:  true,
+        SilenceErrors: true,
+        CompletionOptions: cobra.CompletionOptions{{
+            DisableDefaultCmd: true,
+        }},
+    }}
+
+    cmd.AddCommand(newHelloCmd(&opts))
+    cmd.SetHelpCommand(&cobra.Command{{Hidden: true}})
+    return cmd
+}}
+
+func newHelloCmd(opts *options) *cobra.Command {{
+    cmd := &cobra.Command{{
+        Use:   "hello",
+        Short: "Print a clean greeting.",
+        RunE: func(cmd *cobra.Command, args []string) error {{
+            cmd.Println(renderGreeting(opts.name))
+            return nil
+        }},
+    }}
+
+    cmd.Flags().StringVarP(&opts.name, "name", "n", "world", "Who to greet.")
+    return cmd
+}}
+
+func renderGreeting(name string) string {{
+    return fmt.Sprintf("hello, %s!", name)
+}}
+"#,
+        command_name = spec.command_name
+    )
+}
+
+fn go_cli_root_test_go() -> &'static str {
+    r#"package cmd
+
+import "testing"
+
+func TestRenderGreeting(t *testing.T) {
+    t.Parallel()
+
+    if got := renderGreeting("belay"); got != "hello, belay!" {
+        t.Fatalf("unexpected greeting: %q", got)
+    }
+}
+"#
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -933,7 +1239,7 @@ fn shell_function(shell: Shell) -> &'static str {
         Shell::Bash | Shell::Zsh => {
             r#"belay() {
     case "$1" in
-        py|rs)
+        py|rs-cli|go-cli)
             local target
             target="$(BELAY_SHELL_WRAPPER=1 command belay "$@")"
             local status=$?
@@ -951,7 +1257,7 @@ fn shell_function(shell: Shell) -> &'static str {
         Shell::Fish => {
             r#"function belay
     switch "$argv[1]"
-    case py rs
+    case py rs-cli go-cli
         set -l target (env BELAY_SHELL_WRAPPER=1 command belay $argv)
         set -l command_status $status
         if test $command_status -eq 0; and test -n "$target"
@@ -968,22 +1274,33 @@ end
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Background {
+    Dark,
+    Light,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct Rgb {
+    red: u8,
+    green: u8,
+    blue: u8,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Tone {
     Pink,
-    Plum,
     Purple,
-    Indigo,
-    DeepBlue,
+    White,
+    Black,
 }
 
 impl Tone {
-    fn ansi(self) -> &'static str {
+    fn sgr(self) -> &'static str {
         match self {
-            Self::Pink => ANSI_PINK,
-            Self::Plum => ANSI_PLUM,
-            Self::Purple => ANSI_PURPLE,
-            Self::Indigo => ANSI_INDIGO,
-            Self::DeepBlue => ANSI_DEEP_BLUE,
+            Self::Pink => SGR_PINK,
+            Self::Purple => SGR_PURPLE,
+            Self::White => SGR_WHITE,
+            Self::Black => SGR_BLACK,
         }
     }
 }
@@ -1030,17 +1347,22 @@ const BANNER_LETTERS: [[&str; 6]; 5] = [
         "   ╚═╝   ",
     ],
 ];
-const BANNER_TONES: [Tone; 5] = [
-    Tone::Pink,
-    Tone::Plum,
-    Tone::Purple,
-    Tone::Indigo,
-    Tone::DeepBlue,
+const DARK_BACKGROUND_BANNER_COLORS: [&str; 5] =
+    [SGR_PINK, SGR_PLUM, SGR_VIOLET, SGR_INDIGO, SGR_BLUE];
+const LIGHT_BACKGROUND_BANNER_COLORS: [&str; 5] = [
+    SGR_DARK_PINK,
+    SGR_DARK_PLUM,
+    SGR_PURPLE,
+    SGR_DARK_INDIGO,
+    SGR_DARK_BLUE,
 ];
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct Theme {
     enabled: bool,
+    accent: Tone,
+    text: Tone,
+    banner_colors: [&'static str; 5],
 }
 
 impl Theme {
@@ -1053,14 +1375,50 @@ impl Theme {
     }
 
     fn for_terminal(is_terminal: bool) -> Self {
-        Self {
-            enabled: is_terminal && env::var_os("NO_COLOR").is_none(),
+        if !is_terminal || env::var_os("NO_COLOR").is_some() {
+            return Self::plain();
+        }
+
+        Self::for_background(reported_terminal_background())
+    }
+
+    fn for_background(background: Background) -> Self {
+        match background {
+            Background::Dark => Self {
+                enabled: true,
+                accent: Tone::Pink,
+                text: Tone::White,
+                banner_colors: DARK_BACKGROUND_BANNER_COLORS,
+            },
+            Background::Light => Self {
+                enabled: true,
+                accent: Tone::Purple,
+                text: Tone::Black,
+                banner_colors: LIGHT_BACKGROUND_BANNER_COLORS,
+            },
         }
     }
 
-    fn paint(self, value: impl std::fmt::Display, tone: Tone) -> String {
+    fn plain() -> Self {
+        Self {
+            enabled: false,
+            accent: Tone::Pink,
+            text: Tone::White,
+            banner_colors: DARK_BACKGROUND_BANNER_COLORS,
+        }
+    }
+
+    fn message(self, value: impl std::fmt::Display) -> String {
         if self.enabled {
-            format!("{}{value}{ANSI_RESET}", tone.ansi())
+            format!("{}{value}{SGR_RESET}", self.text.sgr())
+        } else {
+            value.to_string()
+        }
+    }
+
+    fn accent(self, value: impl std::fmt::Display) -> String {
+        if self.enabled {
+            format!("{}{value}{}", self.accent.sgr(), self.text.sgr())
         } else {
             value.to_string()
         }
@@ -1068,20 +1426,174 @@ impl Theme {
 
     fn heading(self, value: &str) -> String {
         if self.enabled {
-            format!("{ANSI_BOLD}{ANSI_PINK}{value}{ANSI_RESET}")
+            format!(
+                "{SGR_BOLD}{}{value}{SGR_NOT_BOLD}{}",
+                self.accent.sgr(),
+                self.text.sgr()
+            )
+        } else {
+            value.to_string()
+        }
+    }
+
+    fn banner_letter(self, value: &str, color: &str) -> String {
+        if self.enabled {
+            format!("{color}{value}{}", self.text.sgr())
         } else {
             value.to_string()
         }
     }
 }
 
+fn reported_terminal_background() -> Background {
+    if let Some(background) = background_override() {
+        return background;
+    }
+
+    *TERMINAL_BACKGROUND.get_or_init(|| query_terminal_background().unwrap_or(Background::Dark))
+}
+
+fn background_override() -> Option<Background> {
+    match env::var("BELAY_BACKGROUND")
+        .ok()?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "dark" => Some(Background::Dark),
+        "light" => Some(Background::Light),
+        _ => None,
+    }
+}
+
+fn classify_background(rgb: Rgb) -> Background {
+    let luminosity =
+        u32::from(rgb.red) * 299 + u32::from(rgb.green) * 587 + u32::from(rgb.blue) * 114;
+    if luminosity >= 150_000 {
+        Background::Light
+    } else {
+        Background::Dark
+    }
+}
+
+fn parse_background_response(response: &[u8]) -> Option<Background> {
+    let response = std::str::from_utf8(response).ok()?;
+    let rgb = response.split_once("rgb:")?.1;
+    let rgb = rgb.split(['\u{7}', '\u{1b}']).next()?;
+    let mut components = rgb.split('/');
+    let color = Rgb {
+        red: parse_color_component(components.next()?)?,
+        green: parse_color_component(components.next()?)?,
+        blue: parse_color_component(components.next()?)?,
+    };
+    if components.next().is_some() {
+        return None;
+    }
+    Some(classify_background(color))
+}
+
+fn parse_color_component(component: &str) -> Option<u8> {
+    if component.is_empty() || component.len() > 4 {
+        return None;
+    }
+
+    let value = u32::from_str_radix(component, 16).ok()?;
+    let maximum = (1_u32 << (component.len() * 4)) - 1;
+    Some(((value * 255 + maximum / 2) / maximum) as u8)
+}
+
+#[cfg(unix)]
+fn query_terminal_background() -> Option<Background> {
+    let mut tty = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .ok()?;
+    let saved_mode = stty_output(&tty, &["-g"])?;
+    let _restore = TerminalModeRestore {
+        tty: tty.try_clone().ok()?,
+        saved_mode,
+    };
+
+    if !stty_status(&tty, &["-echo", "-icanon", "min", "0", "time", "1"]) {
+        return None;
+    }
+
+    tty.write_all(OSC_BACKGROUND_QUERY).ok()?;
+    tty.flush().ok()?;
+
+    let mut response = Vec::new();
+    let mut buffer = [0; 128];
+    for _ in 0..3 {
+        let bytes_read = tty.read(&mut buffer).ok()?;
+        if bytes_read == 0 {
+            break;
+        }
+        response.extend_from_slice(&buffer[..bytes_read]);
+        if response.contains(&b'\x07') || response.windows(2).any(|end| end == b"\x1b\\") {
+            break;
+        }
+    }
+
+    parse_background_response(&response)
+}
+
+#[cfg(not(unix))]
+fn query_terminal_background() -> Option<Background> {
+    None
+}
+
+#[cfg(unix)]
+fn stty_output(tty: &File, args: &[&str]) -> Option<String> {
+    let output = Command::new("stty")
+        .args(args)
+        .stdin(Stdio::from(tty.try_clone().ok()?))
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8(output.stdout).ok()?.trim().to_string())
+}
+
+#[cfg(unix)]
+fn stty_status(tty: &File, args: &[&str]) -> bool {
+    Command::new("stty")
+        .args(args)
+        .stdin(Stdio::from(match tty.try_clone() {
+            Ok(tty) => tty,
+            Err(_) => return false,
+        }))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+struct TerminalModeRestore {
+    tty: File,
+    saved_mode: String,
+}
+
+#[cfg(unix)]
+impl Drop for TerminalModeRestore {
+    fn drop(&mut self) {
+        let _ = stty_status(&self.tty, &[&self.saved_mode]);
+    }
+}
+
 fn render_banner(theme: Theme) -> String {
     let mut banner = String::new();
     for row in 0..BANNER_LETTERS[0].len() {
-        for (letter, tone) in BANNER_LETTERS.iter().zip(BANNER_TONES) {
-            banner.push_str(&theme.paint(letter[row], tone));
+        for (letter, color) in BANNER_LETTERS.iter().zip(theme.banner_colors) {
+            banner.push_str(&theme.banner_letter(letter[row], color));
         }
         banner.push('\n');
+    }
+    if theme.enabled {
+        banner.push_str(SGR_RESET);
     }
     banner
 }
@@ -1094,30 +1606,36 @@ fn print_help() {
     let theme = Theme::stdout();
     print_banner(theme);
     println!(
-        r#"{brand} {version}
+        "{}",
+        theme.message(format!(
+            r#"{brand} {version}
 
 {usage}:
   {brand} {py} <name> [{python} <version>] [{no_shell}]
-  {brand} {rs} <name> [{no_shell}]
+  {brand} {rs_cli} <name> [{no_shell}]
+  {brand} {go_cli} <name> [{no_shell}]
   {brand} {shell} {init} [fish|bash|zsh]
   {brand} {shell} {install} [fish|bash|zsh]
 
 {commands}:
   {py}       Create a typed uv Python project and print/cd to it through shell integration
-  {rs}       Create a Cargo Rust project with Git and print/cd to it through shell integration
+  {rs_cli}   Create a polished Rust CLI scaffold built with clap
+  {go_cli}   Create a polished Go CLI scaffold built with Cobra
   {shell}    Print or install shell integration for automatic cd
 "#,
-        brand = theme.paint("belay", Tone::Pink),
-        version = theme.paint(VERSION, Tone::DeepBlue),
-        usage = theme.heading("Usage"),
-        commands = theme.heading("Commands"),
-        py = theme.paint("py", Tone::Purple),
-        rs = theme.paint("rs", Tone::Purple),
-        shell = theme.paint("shell", Tone::Purple),
-        init = theme.paint("init", Tone::Purple),
-        install = theme.paint("install", Tone::Purple),
-        python = theme.paint("--python", Tone::Purple),
-        no_shell = theme.paint("--no-shell", Tone::Purple),
+            brand = theme.accent("belay"),
+            version = VERSION,
+            usage = theme.heading("Usage"),
+            commands = theme.heading("Commands"),
+            py = theme.accent("py"),
+            rs_cli = theme.accent("rs-cli"),
+            go_cli = theme.accent("go-cli"),
+            shell = theme.accent("shell"),
+            init = theme.accent("init"),
+            install = theme.accent("install"),
+            python = theme.accent("--python"),
+            no_shell = theme.accent("--no-shell"),
+        ))
     );
 }
 
@@ -1125,7 +1643,9 @@ fn print_py_help() {
     let theme = Theme::stdout();
     print_banner(theme);
     println!(
-        r#"{usage}:
+        "{}",
+        theme.message(format!(
+            r#"{usage}:
   {brand} {py} <name> [{python} <version>] [{no_shell}]
 
 {creates} a new directory in the current working directory with:
@@ -1136,60 +1656,92 @@ fn print_py_help() {
   {python} <version>  Python lower bound and .python-version value (default: {default_python})
   {no_shell}          Skip automatic shell integration provisioning
 "#,
-        usage = theme.heading("Usage"),
-        brand = theme.paint("belay", Tone::Pink),
-        py = theme.paint("py", Tone::Purple),
-        python = theme.paint("--python", Tone::Purple),
-        no_shell = theme.paint("--no-shell", Tone::Purple),
-        creates = theme.heading("Creates"),
-        options = theme.heading("Options"),
-        default_python = theme.paint(DEFAULT_PYTHON, Tone::DeepBlue),
+            usage = theme.heading("Usage"),
+            brand = theme.accent("belay"),
+            py = theme.accent("py"),
+            python = theme.accent("--python"),
+            no_shell = theme.accent("--no-shell"),
+            creates = theme.heading("Creates"),
+            options = theme.heading("Options"),
+            default_python = DEFAULT_PYTHON,
+        ))
     );
 }
 
-fn print_rs_help() {
+fn print_rs_cli_help() {
     let theme = Theme::stdout();
     print_banner(theme);
     println!(
-        r#"{usage}:
-  {brand} {rs} <name> [{no_shell}]
+        "{}",
+        theme.message(format!(
+            r#"{usage}:
+  {brand} {rs_cli} <name> [{no_shell}]
 
 {creates} a new directory in the current working directory with:
-  cargo new --bin --vcs none, Git initialized on main, README.md, .editorconfig, and .gitignore
+  Cargo.toml, src/main.rs, src/lib.rs, tests/smoke.rs, README.md
+  clap with styled help output, color-eyre, and Git on main
 
 {options}:
   {no_shell}  Skip automatic shell integration provisioning
 "#,
-        usage = theme.heading("Usage"),
-        brand = theme.paint("belay", Tone::Pink),
-        rs = theme.paint("rs", Tone::Purple),
-        no_shell = theme.paint("--no-shell", Tone::Purple),
-        creates = theme.heading("Creates"),
-        options = theme.heading("Options"),
+            usage = theme.heading("Usage"),
+            brand = theme.accent("belay"),
+            rs_cli = theme.accent("rs-cli"),
+            creates = theme.heading("Creates"),
+            options = theme.heading("Options"),
+            no_shell = theme.accent("--no-shell"),
+        ))
+    );
+}
+
+fn print_go_cli_help() {
+    let theme = Theme::stdout();
+    print_banner(theme);
+    println!(
+        "{}",
+        theme.message(format!(
+            r#"{usage}:
+  {brand} {go_cli} <name> [{no_shell}]
+
+{creates} a new directory in the current working directory with:
+  go.mod, main.go, cmd/root.go, cmd/root_test.go, README.md
+  Cobra with a clean command layout and Git on main
+
+{options}:
+  {no_shell}  Skip automatic shell integration provisioning
+"#,
+            usage = theme.heading("Usage"),
+            brand = theme.accent("belay"),
+            go_cli = theme.accent("go-cli"),
+            creates = theme.heading("Creates"),
+            options = theme.heading("Options"),
+            no_shell = theme.accent("--no-shell"),
+        ))
     );
 }
 
 fn print_shell_help() {
     let theme = Theme::stdout();
     print_banner(theme);
-    println!(
+    println!("{}", theme.message(format!(
         r#"{usage}:
   {brand} {shell} {init} [fish|bash|zsh]
   {brand} {shell} {install} [fish|bash|zsh]
 
 {init_quoted} prints the function for manual shell setup.
-{install_quoted} writes a managed integration block/file so `{brand} {py} <name>` and `{brand} {rs} <name>` can cd into the new directory.
+{install_quoted} writes a managed integration block/file so `{brand} {py} <name>`, `{brand} {rs_cli} <name>`, and `{brand} {go_cli} <name>` can cd into the new directory.
 "#,
         usage = theme.heading("Usage"),
-        brand = theme.paint("belay", Tone::Pink),
-        shell = theme.paint("shell", Tone::Purple),
-        init = theme.paint("init", Tone::Purple),
-        install = theme.paint("install", Tone::Purple),
-        init_quoted = theme.paint("`init`", Tone::Purple),
-        install_quoted = theme.paint("`install`", Tone::Purple),
-        py = theme.paint("py", Tone::Purple),
-        rs = theme.paint("rs", Tone::Purple),
-    );
+        brand = theme.accent("belay"),
+        shell = theme.accent("shell"),
+        init = theme.accent("init"),
+        install = theme.accent("install"),
+        init_quoted = theme.accent("`init`"),
+        install_quoted = theme.accent("`install`"),
+        py = theme.accent("py"),
+        rs_cli = theme.accent("rs-cli"),
+        go_cli = theme.accent("go-cli"),
+    )));
 }
 
 #[derive(Debug)]
@@ -1234,11 +1786,6 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct FakeCargoRunner {
-        calls: RefCell<Vec<(PathBuf, Vec<OsString>)>>,
-    }
-
-    #[derive(Default)]
     struct FakeGitRunner {
         calls: RefCell<Vec<(PathBuf, Vec<OsString>)>>,
     }
@@ -1256,22 +1803,6 @@ mod tests {
                     "unexpected fake uv command `{command}`"
                 ))),
                 None => Err(BelayError::usage("missing fake uv command")),
-            }
-        }
-    }
-
-    impl CargoRunner for FakeCargoRunner {
-        fn run_cargo(&self, current_dir: &Path, args: &[OsString]) -> Result<(), BelayError> {
-            self.calls
-                .borrow_mut()
-                .push((current_dir.to_path_buf(), args.to_vec()));
-
-            match args.first().and_then(|arg| arg.to_str()) {
-                Some("new") => fake_cargo_new(args),
-                Some(command) => Err(BelayError::usage(format!(
-                    "unexpected fake cargo command `{command}`"
-                ))),
-                None => Err(BelayError::usage("missing fake cargo command")),
             }
         }
     }
@@ -1346,37 +1877,6 @@ dev = [
         Ok(())
     }
 
-    fn fake_cargo_new(args: &[OsString]) -> Result<(), BelayError> {
-        let project_dir = PathBuf::from(
-            args.last()
-                .ok_or_else(|| BelayError::usage("missing cargo new path"))?,
-        );
-        let name = arg_after(args, "--name")?;
-
-        fs::create_dir_all(project_dir.join("src"))?;
-        fs::write(
-            project_dir.join("Cargo.toml"),
-            format!(
-                r#"[package]
-name = "{name}"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-"#
-            ),
-        )?;
-        fs::write(
-            project_dir.join("src").join("main.rs"),
-            r#"fn main() {
-    println!("Hello, world!");
-}
-"#,
-        )?;
-
-        Ok(())
-    }
-
     fn fake_git_init(project_dir: &Path) -> Result<(), BelayError> {
         fs::create_dir_all(project_dir.join(".git"))?;
         fs::write(
@@ -1395,35 +1895,66 @@ edition = "2021"
     }
 
     #[test]
-    fn enabled_theme_uses_the_belay_palette() {
-        let theme = Theme { enabled: true };
+    fn dark_background_uses_pink_accent_and_white_text() {
+        let theme = Theme::for_background(Background::Dark);
         let banner = render_banner(theme);
+        let message = theme.message(format!("{} version", theme.accent("belay")));
 
+        assert_eq!(theme.accent("belay"), format!("{SGR_PINK}belay{SGR_WHITE}"));
         assert_eq!(
-            theme.paint("belay", Tone::Pink),
-            format!("{ANSI_PINK}belay{ANSI_RESET}")
-        );
-        assert_eq!(
-            theme.paint("py", Tone::Purple),
-            format!("{ANSI_PURPLE}py{ANSI_RESET}")
+            message,
+            format!("{SGR_WHITE}{SGR_PINK}belay{SGR_WHITE} version{SGR_RESET}")
         );
         assert_eq!(
             theme.heading("Usage"),
-            format!("{ANSI_BOLD}{ANSI_PINK}Usage{ANSI_RESET}")
+            format!("{SGR_BOLD}{SGR_PINK}Usage{SGR_NOT_BOLD}{SGR_WHITE}")
         );
-        assert!(banner.contains(ANSI_PINK));
-        assert!(banner.contains(ANSI_PLUM));
-        assert!(banner.contains(ANSI_PURPLE));
-        assert!(banner.contains(ANSI_INDIGO));
-        assert!(banner.contains(ANSI_DEEP_BLUE));
+        assert!(banner.contains(SGR_PINK));
+        assert!(banner.contains(SGR_PLUM));
+        assert!(banner.contains(SGR_VIOLET));
+        assert!(banner.contains(SGR_INDIGO));
+        assert!(banner.contains(SGR_BLUE));
+    }
+
+    #[test]
+    fn light_background_uses_purple_accent_and_black_text() {
+        let theme = Theme::for_background(Background::Light);
+        let banner = render_banner(theme);
+
+        assert_eq!(
+            theme.accent("belay"),
+            format!("{SGR_PURPLE}belay{SGR_BLACK}")
+        );
+        assert_eq!(theme.message("body"), format!("{SGR_BLACK}body{SGR_RESET}"));
+        assert!(banner.contains(SGR_DARK_PINK));
+        assert!(banner.contains(SGR_DARK_PLUM));
+        assert!(banner.contains(SGR_PURPLE));
+        assert!(banner.contains(SGR_DARK_INDIGO));
+        assert!(banner.contains(SGR_DARK_BLUE));
+    }
+
+    #[test]
+    fn parses_terminal_reported_background_brightness() {
+        assert_eq!(
+            parse_background_response(b"\x1b]11;rgb:1919/1b1b/2424\x1b\\"),
+            Some(Background::Dark)
+        );
+        assert_eq!(
+            parse_background_response(b"\x1b]11;rgb:ffff/fafa/f5f5\x07"),
+            Some(Background::Light)
+        );
+        assert_eq!(
+            parse_background_response(b"\x1b]11;rgb:f5/f5/f5\x1b\\"),
+            Some(Background::Light)
+        );
     }
 
     #[test]
     fn disabled_theme_banner_and_shell_functions_stay_plain() {
-        let theme = Theme { enabled: false };
+        let theme = Theme::plain();
         let banner = render_banner(theme);
 
-        assert_eq!(theme.paint("/tmp/project", Tone::DeepBlue), "/tmp/project");
+        assert_eq!(theme.message("/tmp/project"), "/tmp/project");
         assert_eq!(theme.heading("Usage"), "Usage");
         assert!(banner.starts_with("██████╗ ███████╗██╗"));
         assert!(!banner.contains('\u{1b}'));
@@ -1438,15 +1969,22 @@ edition = "2021"
     }
 
     #[test]
+    fn normalizes_cli_project_names() {
+        let rust_spec = RustCliProjectSpec::new("My_App.Tools").unwrap();
+        let go_spec = GoCliProjectSpec::new("My_App.Tools").unwrap();
+
+        assert_eq!(rust_spec.package_name, "my-app-tools");
+        assert_eq!(rust_spec.crate_name, "my_app_tools");
+        assert_eq!(go_spec.module_name, "my-app-tools");
+    }
+
+    #[test]
     fn rejects_names_that_cannot_be_modules() {
         assert!(PythonProjectSpec::new("123-app", "3.13").is_err());
         assert!(PythonProjectSpec::new("bad/path", "3.13").is_err());
         assert!(PythonProjectSpec::new("bad name", "3.13").is_err());
-    }
-
-    #[test]
-    fn rejects_rust_names_with_dots() {
-        assert!(RustProjectSpec::new("bad.name").is_err());
+        assert!(RustCliProjectSpec::new("123-app").is_err());
+        assert!(GoCliProjectSpec::new("123-app").is_err());
     }
 
     #[test]
@@ -1513,45 +2051,59 @@ edition = "2021"
     }
 
     #[test]
-    fn creates_rust_project_layout() {
+    fn creates_rust_cli_project_layout() {
         let root = unique_temp_dir();
         fs::create_dir(&root).unwrap();
-        let project_dir = root.join("sample-app");
-        let spec = RustProjectSpec::new("sample-app").unwrap();
-        let runner = FakeCargoRunner::default();
+        let project_dir = root.join("sample-cli");
+        let spec = RustCliProjectSpec::new("sample-cli").unwrap();
         let git_runner = FakeGitRunner::default();
 
-        create_rust_project_with_runner(&project_dir, &spec, &runner).unwrap();
+        create_rust_cli_project(&project_dir, &spec).unwrap();
         finish_project_creation_with_git_runner(&project_dir, false, &git_runner).unwrap();
 
-        assert!(project_dir.join(".git").exists());
-        assert!(project_dir.join(".gitignore").exists());
         assert!(project_dir.join("Cargo.toml").exists());
         assert!(project_dir.join("README.md").exists());
-        assert!(project_dir.join(".editorconfig").exists());
         assert!(project_dir.join("src").join("main.rs").exists());
+        assert!(project_dir.join("src").join("lib.rs").exists());
+        assert!(project_dir.join("tests").join("smoke.rs").exists());
+        assert!(project_dir.join(".git").exists());
 
         let cargo_toml = fs::read_to_string(project_dir.join("Cargo.toml")).unwrap();
-        assert!(cargo_toml.contains("name = \"sample-app\""));
+        assert!(cargo_toml.contains("clap = { version = \"4.5\""));
+        assert!(cargo_toml.contains("color-eyre = \"0.6\""));
 
-        let gitignore = fs::read_to_string(project_dir.join(".gitignore")).unwrap();
-        assert!(gitignore.contains("/target"));
-        assert!(gitignore.contains(".DS_Store"));
+        let main_rs = fs::read_to_string(project_dir.join("src").join("main.rs")).unwrap();
+        assert!(main_rs.contains("A polished CLI scaffold built with clap."));
+        assert!(main_rs.contains("render_greeting"));
 
-        let head = fs::read_to_string(project_dir.join(".git").join("HEAD")).unwrap();
-        assert_eq!(head, "ref: refs/heads/main\n");
+        fs::remove_dir_all(root).unwrap();
+    }
 
-        let readme = fs::read_to_string(project_dir.join("README.md")).unwrap();
-        assert!(readme.contains("cargo clippy --all-targets --all-features -- -D warnings"));
+    #[test]
+    fn creates_go_cli_project_layout() {
+        let root = unique_temp_dir();
+        fs::create_dir(&root).unwrap();
+        let project_dir = root.join("sample-go");
+        let spec = GoCliProjectSpec::new("sample-go").unwrap();
+        let git_runner = FakeGitRunner::default();
 
-        let calls = runner.calls.borrow();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].1, cargo_new_args(&project_dir, &spec));
+        create_go_cli_project(&project_dir, &spec).unwrap();
+        finish_project_creation_with_git_runner(&project_dir, false, &git_runner).unwrap();
 
-        let git_calls = git_runner.calls.borrow();
-        assert_eq!(git_calls.len(), 1);
-        assert_eq!(git_calls[0].0, project_dir);
-        assert_eq!(git_calls[0].1, git_init_args());
+        assert!(project_dir.join("go.mod").exists());
+        assert!(project_dir.join("README.md").exists());
+        assert!(project_dir.join("main.go").exists());
+        assert!(project_dir.join("cmd").join("root.go").exists());
+        assert!(project_dir.join("cmd").join("root_test.go").exists());
+        assert!(project_dir.join(".git").exists());
+
+        let go_mod = fs::read_to_string(project_dir.join("go.mod")).unwrap();
+        assert!(go_mod.contains("github.com/spf13/cobra"));
+        assert!(go_mod.contains(DEFAULT_COBRA_VERSION));
+
+        let root_go = fs::read_to_string(project_dir.join("cmd").join("root.go")).unwrap();
+        assert!(root_go.contains("A polished CLI scaffold built with Cobra."));
+        assert!(root_go.contains("renderGreeting"));
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -1581,7 +2133,7 @@ edition = "2021"
         assert!(new.contains("before"));
         assert!(new.contains("after"));
         assert!(new.contains("BELAY_SHELL_WRAPPER=1"));
-        assert!(new.contains("py|rs"));
+        assert!(new.contains("py|rs-cli|go-cli)"));
         assert!(!new.contains("\nold\n"));
         assert_eq!(new.matches(BELAY_BEGIN).count(), 1);
     }
